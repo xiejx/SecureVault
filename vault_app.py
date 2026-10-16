@@ -4,14 +4,18 @@
 * 免安装、双击即用：程序与保险箱数据放在同一目录，整个文件夹可直接搬上 U 盘
 * 支持把文件 / 整个文件夹从资源管理器拖进窗口，目录层级会被完整保留
 * 支持新建文件夹、重命名、移动到其他文件夹、递归删除
-* 导出时按保险箱内的目录结构还原到本地
+* 双击文件即可像资源管理器那样用系统默认程序打开，改动会在锁定/退出时自动回存
+* 右键或工具栏「导出」可把文件按原目录结构解密还原到本地
 * 空闲自动锁定，锁定后内存中的密钥被丢弃
 """
 
 from __future__ import annotations
 
+import os
 import queue
+import shutil
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path, PurePosixPath
@@ -40,6 +44,7 @@ except Exception:  # pragma: no cover
 FOLDER_PREFIX = "folder:"
 FILE_PREFIX = "file:"
 ROOT_LABEL = "（根目录）"
+WORKSPACE_PREFIX = "VaultApp_open_"     # 双击打开时的临时解密目录前缀
 
 
 def app_dir() -> Path:
@@ -183,6 +188,9 @@ class VaultApp:
         self._busy = False
         self._auto_lock_job = None
         self._open_folders: set[str] = set()
+        self._workspace_dir: Path | None = None
+        self._opened: dict[str, dict] = {}   # fid -> {path, rel, size, mtime}
+        self._purge_stale_workspaces()
 
         self._lock_frame = self._build_lock_view()
         self._main_frame = self._build_main_view()
@@ -258,7 +266,7 @@ class VaultApp:
 
         self._progress = ttk.Progressbar(toolbar, mode="indeterminate", length=120)
 
-        dnd_hint = "拖入文件/文件夹即可加密 · 双击文件可导出" if DND_AVAILABLE else "双击文件可导出到本地"
+        dnd_hint = "拖入文件/文件夹即可加密 · 双击文件可直接打开" if DND_AVAILABLE else "双击文件可直接打开"
         ttk.Label(toolbar, text=dnd_hint, foreground="#888").pack(side="right")
 
         tree_wrap = ttk.Frame(frame, padding=(10, 0))
@@ -286,6 +294,7 @@ class VaultApp:
         self._tree.bind("<<TreeviewClose>>", lambda _e: self._remember_open(False))
 
         self._menu = tk.Menu(self.root, tearoff=0)
+        self._menu.add_command(label="打开", command=self._on_open_selected)
         self._menu.add_command(label="导出到本地…", command=self._on_export_selected)
         self._menu.add_command(label="移动到…", command=self._on_move)
         self._menu.add_command(label="重命名", command=self._on_rename)
@@ -390,14 +399,22 @@ class VaultApp:
             self._run_async(work, done, "正在校验密码…")
 
     def _on_lock_now(self) -> None:
+        saved, failed = self._sync_open_files()
         self.vault.lock()
         if self._auto_lock_job:
             self.root.after_cancel(self._auto_lock_job)
             self._auto_lock_job = None
+        self._cleanup_workspace()
         self._open_folders = set()
         self._lock_var.set("")
         self._show_lock(create=False)
-        self._set_status("已锁定")
+        if failed:
+            messagebox.showwarning(
+                "部分改动未能回存",
+                "以下文件正被其它程序占用，改动未写回保险箱：\n\n" + "\n".join(failed[:10]),
+                parent=self.root,
+            )
+        self._set_status(f"已锁定（回存 {saved} 个改动文件）" if saved else "已锁定")
 
     # ================= 选择辅助 =================
     def _selected_file_ids(self) -> list[str]:
@@ -532,22 +549,97 @@ class VaultApp:
             return "break"
 
         fid = iid[len(FILE_PREFIX):]
-        target = filedialog.asksaveasfilename(
-            parent=self.root, title="导出到", initialfile=self._tree.item(iid, "text"),
-        )
-        if not target:
-            return "break"
+        self._open_file(fid)
+        return "break"
+
+    # ================= 双击打开（临时解密 + 系统默认程序）=================
+    def _purge_stale_workspaces(self) -> None:
+        """启动时清理上次运行遗留的临时明文目录。"""
+        try:
+            for path in Path(tempfile.gettempdir()).glob(WORKSPACE_PREFIX + "*"):
+                shutil.rmtree(path, ignore_errors=True)
+        except OSError:
+            pass
+
+    def _workspace(self) -> Path:
+        if self._workspace_dir is None:
+            self._workspace_dir = Path(tempfile.mkdtemp(prefix=WORKSPACE_PREFIX))
+        return self._workspace_dir
+
+    def _open_file(self, fid: str) -> None:
+        """像资源管理器那样双击打开：解密到临时目录后交给系统默认程序。"""
+        info = next((item for item in self.vault.list_files() if item["fid"] == fid), None)
+        if info is None:
+            return
+
+        record = self._opened.get(fid)
+        if record is not None and record["path"].exists():
+            self._launch(record["path"], record["rel"])
+            return
+
+        target = self._workspace() / PurePosixPath(info["path"])
 
         def work():
-            self.vault.extract_file(fid, Path(target))
+            self.vault.extract_file(fid, target)
             return target
 
         def done(path):
-            self._set_status(f"已导出到 {path}")
-            messagebox.showinfo("完成", f"已解密导出到：\n{path}", parent=self.root)
+            stat = Path(path).stat()
+            self._opened[fid] = {
+                "path": Path(path), "rel": info["path"],
+                "size": stat.st_size, "mtime": stat.st_mtime,
+            }
+            self._launch(Path(path), info["path"])
 
-        self._run_async(work, done, "正在解密导出…")
-        return "break"
+        self._run_async(work, done, f"正在解密打开 {info['path']}…")
+
+    def _launch(self, path: Path, rel: str) -> None:
+        try:
+            os.startfile(str(path))
+        except OSError as exc:
+            messagebox.showerror(
+                "无法打开",
+                f"未能用默认程序打开 {rel}：\n{exc}\n\n可改用“导出到本地…”手动保存。",
+                parent=self.root,
+            )
+            return
+        self._set_status(f"已打开：{rel}（改动将在锁定或退出时自动回存）")
+
+    def _sync_open_files(self) -> tuple[int, list[str]]:
+        """把外部程序修改过的临时文件重新加密回存到保险箱。"""
+        if not self.vault.is_unlocked or not self._opened:
+            return 0, []
+        saved, failed = 0, []
+        for fid, record in list(self._opened.items()):
+            path = record["path"]
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            if stat.st_size == record["size"] and stat.st_mtime == record["mtime"]:
+                continue
+            try:
+                self.vault.replace_file(fid, path)
+                record["size"] = stat.st_size
+                record["mtime"] = stat.st_mtime
+                saved += 1
+            except VaultError as exc:
+                failed.append(f"{record['rel']}：{exc}")
+        return saved, failed
+
+    def _cleanup_workspace(self) -> None:
+        self._opened.clear()
+        if self._workspace_dir is not None:
+            shutil.rmtree(self._workspace_dir, ignore_errors=True)
+            self._workspace_dir = None
+
+    def _on_open_selected(self) -> None:
+        fids = self._selected_file_ids()
+        if not fids:
+            messagebox.showinfo("提示", "请先选择要打开的文件（文件夹无法直接打开）", parent=self.root)
+            return
+        for fid in fids:
+            self._open_file(fid)
 
     # ================= 删除 / 重命名 / 移动 =================
     def _on_delete(self) -> None:
@@ -824,7 +916,9 @@ class VaultApp:
     # ================= 收尾 =================
     def _on_close(self) -> None:
         if self.vault.is_unlocked:
+            self._sync_open_files()
             self.vault.lock()
+        self._cleanup_workspace()
         self.root.destroy()
 
     def run(self) -> None:

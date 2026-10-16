@@ -338,6 +338,34 @@ class Vault:
             raise VaultError(f"写入目标失败：{exc}") from exc
         return dst
 
+    def replace_file(self, fid: str, src_path) -> dict:
+        """用磁盘上的新内容覆盖保险箱内同 ID 的文件（用于外部编辑后回存）。
+
+        blob 路径由 fid 决定，AAD 也绑定 fid，因此原地替换不会破坏认证。
+        """
+        self._require_unlocked()
+        info = self.index["files"].get(fid)
+        if info is None:
+            raise VaultError("文件不存在")
+        src = Path(src_path)
+        if not src.is_file():
+            raise VaultError("源文件不存在")
+
+        tmp = self.data_dir / f".{fid}.tmp"
+        try:
+            with open(src, "rb") as fin, open(tmp, "wb") as fout:
+                size = self.keys.encrypt_file(fin, fout, fid.encode("ascii"))
+            os.replace(tmp, self._blob_path(fid))
+        except (VaultCryptoError, OSError) as exc:
+            tmp.unlink(missing_ok=True)
+            raise VaultError(f"回存失败：{exc}") from exc
+
+        stat = src.stat()
+        info["size"] = size
+        info["mtime"] = datetime.fromtimestamp(stat.st_mtime).astimezone().isoformat(timespec="seconds")
+        self._save_index()
+        return {"fid": fid, **info}
+
     # ---------------- 删除 ----------------
     def _drop_file(self, fid: str, secure: bool) -> None:
         blob = self._blob_path(fid)
