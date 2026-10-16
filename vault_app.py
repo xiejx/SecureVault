@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import os
 import queue
 import shutil
@@ -77,6 +78,36 @@ def unique_target(target: Path) -> Path:
         if not candidate.exists():
             return candidate
         i += 1
+
+
+def enable_high_dpi() -> None:
+    """声明进程 DPI 感知，避免 Windows 对窗口内容做位图拉伸导致界面发虚。
+
+    必须在创建 Tk 窗口之前调用。逐级降级：Win10 1703+ 的 PMv2 → Win8.1 的
+    shcore → Vista 的 SetProcessDPIAware。
+    """
+    if sys.platform != "win32":
+        return
+    try:  # Windows 10 1703+：按显示器 DPI 感知（V2），最清晰
+        fn = ctypes.windll.user32.SetProcessDpiAwarenessContext
+        fn.argtypes = [ctypes.c_void_p]
+        fn.restype = ctypes.c_bool
+        if fn(ctypes.c_void_p(-4)):
+            return
+    except Exception:
+        pass
+    try:  # Windows 8.1+
+        fn = ctypes.windll.shcore.SetProcessDpiAwareness
+        fn.argtypes = [ctypes.c_int]
+        fn.restype = ctypes.c_long
+        if fn(2) == 0:
+            return
+    except Exception:
+        pass
+    try:  # Windows Vista+
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
 
 
 class PasswordDialog(tk.Toplevel):
@@ -174,14 +205,13 @@ class FolderPickerDialog(tk.Toplevel):
 
 class VaultApp:
     def __init__(self):
+        enable_high_dpi()
         self.root = TkinterDnD.Tk() if DND_AVAILABLE else tk.Tk()
         self.root.title("便携加密保险箱")
-        self.root.geometry("860x580")
-        self.root.minsize(680, 460)
-        try:
-            self.root.call("tk", "scaling", 1.25)
-        except tk.TclError:
-            pass
+        self._scale = 1.0
+        self._apply_dpi()
+        self.root.geometry(f"{self._px(860)}x{self._px(580)}")
+        self.root.minsize(self._px(680), self._px(460))
 
         self.vault = Vault(VAULT_DIR)
         self._last_activity = time.monotonic()
@@ -201,6 +231,30 @@ class VaultApp:
 
         self._show_lock(create=not Vault.exists(VAULT_DIR))
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    # ================= DPI 缩放 =================
+    def _apply_dpi(self) -> None:
+        """按显示器真实 DPI 设置 Tk 缩放，使 ttk 控件与字体尺寸匹配屏幕。"""
+        dpi = 96.0
+        try:
+            dpi = float(self.root.winfo_fpixels("1i"))
+        except tk.TclError:
+            pass
+        if sys.platform == "win32":
+            try:
+                dpi = max(dpi, float(ctypes.windll.user32.GetDpiForSystem()))
+            except Exception:
+                pass
+        dpi = max(96.0, dpi)
+        self._scale = dpi / 96.0
+        try:
+            self.root.tk.call("tk", "scaling", dpi / 72.0)
+        except tk.TclError:
+            pass
+
+    def _px(self, value: float) -> int:
+        """把按 96 DPI 设计的像素值换算到当前缩放。"""
+        return max(1, int(round(value * self._scale)))
 
     # ================= 界面构建 =================
     def _build_lock_view(self) -> ttk.Frame:
@@ -237,7 +291,7 @@ class VaultApp:
 
         ttk.Label(
             card, text=f"保险箱位置：{VAULT_DIR}",
-            foreground="#888", wraplength=360, justify="center",
+            foreground="#888", wraplength=self._px(360), justify="center",
         ).pack()
         hint = "拖拽文件或文件夹即可加密保存" if DND_AVAILABLE else "此构建未启用拖拽，请使用“添加文件”按钮"
         ttk.Label(card, text=hint, foreground="#888").pack(pady=(2, 0))
@@ -249,7 +303,7 @@ class VaultApp:
     def _build_main_view(self) -> ttk.Frame:
         frame = ttk.Frame(self.root)
 
-        toolbar = ttk.Frame(frame, padding=(10, 8))
+        toolbar = ttk.Frame(frame, padding=(self._px(10), self._px(8)))
         toolbar.pack(fill="x")
         self._buttons: list[ttk.Button] = []
         for text, command in (
@@ -264,12 +318,12 @@ class VaultApp:
             btn.pack(side="left", padx=(0, 6))
             self._buttons.append(btn)
 
-        self._progress = ttk.Progressbar(toolbar, mode="indeterminate", length=120)
+        self._progress = ttk.Progressbar(toolbar, mode="indeterminate", length=self._px(120))
 
         dnd_hint = "拖入文件/文件夹即可加密 · 双击文件可直接打开" if DND_AVAILABLE else "双击文件可直接打开"
         ttk.Label(toolbar, text=dnd_hint, foreground="#888").pack(side="right")
 
-        tree_wrap = ttk.Frame(frame, padding=(10, 0))
+        tree_wrap = ttk.Frame(frame, padding=(self._px(10), 0))
         tree_wrap.pack(fill="both", expand=True)
 
         self._tree = ttk.Treeview(
@@ -278,9 +332,9 @@ class VaultApp:
         self._tree.heading("#0", text="名称")
         self._tree.heading("size", text="大小")
         self._tree.heading("mtime", text="修改时间")
-        self._tree.column("#0", width=420, anchor="w")
-        self._tree.column("size", width=110, anchor="e")
-        self._tree.column("mtime", width=180, anchor="center")
+        self._tree.column("#0", width=self._px(420), anchor="w")
+        self._tree.column("size", width=self._px(110), anchor="e")
+        self._tree.column("mtime", width=self._px(180), anchor="center")
 
         vsb = ttk.Scrollbar(tree_wrap, orient="vertical", command=self._tree.yview)
         self._tree.configure(yscrollcommand=vsb.set)
@@ -304,7 +358,7 @@ class VaultApp:
         self._menu.add_command(label="新建文件夹", command=self._on_new_folder)
         self._tree.bind("<Button-3>", self._on_tree_right_click)
 
-        status = ttk.Frame(frame, padding=(10, 6))
+        status = ttk.Frame(frame, padding=(self._px(10), self._px(6)))
         status.pack(fill="x")
         self._status_var = tk.StringVar(value="就绪")
         ttk.Label(status, textvariable=self._status_var, foreground="#444").pack(side="left")
