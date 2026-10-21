@@ -16,7 +16,6 @@ import os
 import queue
 import shutil
 import sys
-import tempfile
 import threading
 import time
 from pathlib import Path, PurePosixPath
@@ -45,7 +44,6 @@ except Exception:  # pragma: no cover
 FOLDER_PREFIX = "folder:"
 FILE_PREFIX = "file:"
 ROOT_LABEL = "（根目录）"
-WORKSPACE_PREFIX = "VaultApp_open_"     # 双击打开时的临时解密目录前缀
 
 
 def app_dir() -> Path:
@@ -56,6 +54,7 @@ def app_dir() -> Path:
 
 
 VAULT_DIR = app_dir() / "vault"
+WORKSPACE_DIR = app_dir() / ".vault_open"   # 双击打开时的临时解密目录
 
 
 def human_size(n: int) -> str:
@@ -606,22 +605,19 @@ class VaultApp:
         self._open_file(fid)
         return "break"
 
-    # ================= 双击打开（临时解密 + 系统默认程序）=================
+    # ================= 双击打开（明文缓存 + 系统默认程序）=================
     def _purge_stale_workspaces(self) -> None:
-        """启动时清理上次运行遗留的临时明文目录。"""
-        try:
-            for path in Path(tempfile.gettempdir()).glob(WORKSPACE_PREFIX + "*"):
-                shutil.rmtree(path, ignore_errors=True)
-        except OSError:
-            pass
+        """启动时清理上次运行遗留的明文缓存目录。"""
+        shutil.rmtree(WORKSPACE_DIR, ignore_errors=True)
 
     def _workspace(self) -> Path:
         if self._workspace_dir is None:
-            self._workspace_dir = Path(tempfile.mkdtemp(prefix=WORKSPACE_PREFIX))
+            WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
+            self._workspace_dir = WORKSPACE_DIR
         return self._workspace_dir
 
     def _open_file(self, fid: str) -> None:
-        """像资源管理器那样双击打开：解密到临时目录后交给系统默认程序。"""
+        """像资源管理器那样双击打开：解密到程序目录的缓存后交给系统默认程序。"""
         info = next((item for item in self.vault.list_files() if item["fid"] == fid), None)
         if info is None:
             return

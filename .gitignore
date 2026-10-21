@@ -15,6 +15,9 @@ vault/
 data/
 *.vault
 
+# 双击打开时的明文缓存目录
+.vault_open/
+
 # 编辑器 / 系统
 .idea/
 .vscode/
