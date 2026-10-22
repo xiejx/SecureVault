@@ -6,7 +6,8 @@ vault/
 ├── meta.json          明文元数据：KDF 参数、盐、被包装的 DEK
 ├── index.enc          加密索引：文件夹层级 + 相对路径 / 大小 / 时间
 └── data/
-    └── <随机ID>.bin   每个文件独立 AES-256-GCM 加密
+    └── <前两位>/
+        └── <随机ID>.bin   每个文件独立 AES-256-GCM 加密，按 ID 前两位分片
 
 索引中文件以「相对路径」记录（如 photos/2024/a.jpg），文件夹层级由索引
 中的 folders 列表 + 文件路径共同还原，因此文件名与目录名都不会明文落盘。
@@ -200,6 +201,7 @@ class Vault:
             self.keys = None
             raise VaultError(str(exc)) from exc
         self._migrate()
+        self._migrate_blobs()
         self.auto_lock_seconds = int(meta.get("auto_lock_seconds", DEFAULT_AUTO_LOCK))
         return True
 
@@ -217,6 +219,29 @@ class Vault:
                 known.add(ancestor)
         self.index["folders"] = sorted(known)
 
+    def _migrate_blobs(self) -> None:
+        """把旧版扁平的 data/<id>.bin 迁移到 data/<前两位>/<id>.bin。"""
+        try:
+            entries = list(os.scandir(self.data_dir))
+        except (FileNotFoundError, OSError):
+            return
+        files = self.index["files"]
+        for entry in entries:
+            name = entry.name
+            if not name.endswith(".bin") or not entry.is_file():
+                continue
+            fid = name[:-4]
+            if fid not in files:
+                continue
+            target = self._blob_path(fid)
+            if target.exists():
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                os.replace(entry.path, target)
+            except OSError:
+                pass
+
     def lock(self) -> None:
         self.keys = None
         self.index = None
@@ -227,7 +252,14 @@ class Vault:
         _atomic_write(self.index_path, self.keys.encrypt_index(self.index))
 
     def _blob_path(self, fid: str) -> Path:
-        return self.data_dir / f"{fid}.bin"
+        """密文按 ID 前两位分片存放：data/<前两位>/<id>.bin。"""
+        return self.data_dir / fid[:2] / f"{fid}.bin"
+
+    def _scratch(self, fid: str) -> Path:
+        """写入前的临时文件，放在与目标相同的分片目录内，保证替换原子性。"""
+        blob = self._blob_path(fid)
+        blob.parent.mkdir(parents=True, exist_ok=True)
+        return blob.with_name(f".{fid}.tmp")
 
     def _require_unlocked(self) -> None:
         if not self.is_unlocked:
@@ -283,7 +315,7 @@ class Vault:
                 continue
 
             fid = uuid.uuid4().hex
-            tmp = self.data_dir / f".{fid}.tmp"
+            tmp = self._scratch(fid)
             try:
                 with open(src, "rb") as fin, open(tmp, "wb") as fout:
                     size = self.keys.encrypt_file(fin, fout, fid.encode("ascii"))
@@ -351,7 +383,7 @@ class Vault:
         if not src.is_file():
             raise VaultError("源文件不存在")
 
-        tmp = self.data_dir / f".{fid}.tmp"
+        tmp = self._scratch(fid)
         try:
             with open(src, "rb") as fin, open(tmp, "wb") as fout:
                 size = self.keys.encrypt_file(fin, fout, fid.encode("ascii"))
