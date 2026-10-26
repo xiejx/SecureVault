@@ -79,6 +79,46 @@ def unique_target(target: Path) -> Path:
         i += 1
 
 
+def make_folder_icon(size: int) -> tk.PhotoImage:
+    """绘制文件夹图标（黄色文件夹），背景透明，不依赖外部图片文件。"""
+    img = tk.PhotoImage(width=size, height=size)
+    scale = size / 16.0
+
+    def rect(x0: int, y0: int, x1: int, y1: int, color: str) -> None:
+        px0, py0 = int(round(x0 * scale)), int(round(y0 * scale))
+        px1, py1 = int(round((x1 + 1) * scale)), int(round((y1 + 1) * scale))
+        img.put(color, to=(px0, py0, max(px0 + 1, px1), max(py0 + 1, py1)))
+
+    rect(1, 3, 5, 4, "#C98E0B")      # 标签页
+    rect(2, 3, 5, 3, "#E3A81E")
+    rect(1, 4, 14, 13, "#C98E0B")     # 主体轮廓
+    rect(2, 5, 13, 12, "#F7C948")     # 主体填充
+    rect(2, 5, 13, 6, "#FFD971")      # 顶部高光
+    return img
+
+
+def make_file_icon(size: int) -> tk.PhotoImage:
+    """绘制文件图标（白色纸张 + 文字行），背景透明。"""
+    img = tk.PhotoImage(width=size, height=size)
+    scale = size / 16.0
+
+    def rect(x0: int, y0: int, x1: int, y1: int, color: str) -> None:
+        px0, py0 = int(round(x0 * scale)), int(round(y0 * scale))
+        px1, py1 = int(round((x1 + 1) * scale)), int(round((y1 + 1) * scale))
+        img.put(color, to=(px0, py0, max(px0 + 1, px1), max(py0 + 1, py1)))
+
+    rect(3, 1, 11, 14, "#8D99A6")     # 纸张轮廓
+    rect(4, 2, 10, 13, "#FFFFFF")     # 纸张
+    rect(8, 1, 11, 1, "#D5DDE5")      # 右上折角（阶梯近似斜边）
+    rect(9, 2, 11, 2, "#D5DDE5")
+    rect(10, 3, 11, 3, "#D5DDE5")
+    rect(11, 4, 11, 4, "#D5DDE5")
+    for y in (5, 7, 9):
+        rect(5, y, 9, y, "#B6C0CA")   # 文字行
+    rect(5, 11, 7, 11, "#B6C0CA")
+    return img
+
+
 def enable_high_dpi() -> None:
     """声明进程 DPI 感知，避免 Windows 对窗口内容做位图拉伸导致界面发虚。
 
@@ -217,6 +257,9 @@ class VaultApp:
         self._busy = False
         self._auto_lock_job = None
         self._open_folders: set[str] = set()
+        self._sort_column = "name"          # name | size | mtime
+        self._sort_desc = False
+        self._search_job = None
         self._workspace_dir: Path | None = None
         self._opened: dict[str, dict] = {}   # fid -> {path, rel, size, mtime}
         self._purge_stale_workspaces()
@@ -319,8 +362,21 @@ class VaultApp:
 
         self._progress = ttk.Progressbar(toolbar, mode="indeterminate", length=self._px(120))
 
+        search_bar = ttk.Frame(frame, padding=(self._px(10), 0, self._px(10), self._px(6)))
+        search_bar.pack(fill="x")
+        ttk.Label(search_bar, text="搜索：").pack(side="left")
+        self._search_var = tk.StringVar()
+        self._search_entry = ttk.Entry(search_bar, textvariable=self._search_var, width=28)
+        self._search_entry.pack(side="left")
+        self._search_entry.bind("<KeyRelease>", self._on_search_changed)
+        self._search_entry.bind("<Return>", lambda _e: self._apply_search())
+        self._search_entry.bind("<Escape>", lambda _e: self._clear_search())
+        ttk.Button(search_bar, text="清除", width=6, command=self._clear_search).pack(
+            side="left", padx=(6, 0)
+        )
+
         dnd_hint = "拖入文件/文件夹即可加密 · 双击文件可直接打开" if DND_AVAILABLE else "双击文件可直接打开"
-        ttk.Label(toolbar, text=dnd_hint, foreground="#888").pack(side="right")
+        ttk.Label(search_bar, text=dnd_hint, foreground="#888").pack(side="right")
 
         tree_wrap = ttk.Frame(frame, padding=(self._px(10), 0))
         tree_wrap.pack(fill="both", expand=True)
@@ -328,12 +384,17 @@ class VaultApp:
         self._tree = ttk.Treeview(
             tree_wrap, columns=("size", "mtime"), show="tree headings", selectmode="extended",
         )
-        self._tree.heading("#0", text="名称")
-        self._tree.heading("size", text="大小")
-        self._tree.heading("mtime", text="修改时间")
+        self._tree.heading("#0", text="名称", command=lambda: self._on_sort("name"))
+        self._tree.heading("size", text="大小", command=lambda: self._on_sort("size"))
+        self._tree.heading("mtime", text="修改时间", command=lambda: self._on_sort("mtime"))
+        self._update_headings()
         self._tree.column("#0", width=self._px(420), anchor="w")
         self._tree.column("size", width=self._px(110), anchor="e")
         self._tree.column("mtime", width=self._px(180), anchor="center")
+
+        icon_size = self._px(16)
+        self._folder_icon = make_folder_icon(icon_size)
+        self._file_icon = make_file_icon(icon_size)
 
         vsb = ttk.Scrollbar(tree_wrap, orient="vertical", command=self._tree.yview)
         self._tree.configure(yscrollcommand=vsb.set)
@@ -341,6 +402,8 @@ class VaultApp:
         vsb.pack(side="right", fill="y")
 
         self._tree.bind("<Double-1>", self._on_tree_double_click)
+        self._tree.bind("<Button-1>", self._on_tree_click, add="+")
+        self._tree.bind("<Escape>", lambda _e: self._clear_selection())
         self._tree.bind("<Delete>", lambda _e: self._on_delete())
         self._tree.bind("<F2>", lambda _e: self._on_rename())
         self._tree.bind("<<TreeviewOpen>>", lambda _e: self._remember_open(True))
@@ -408,6 +471,7 @@ class VaultApp:
         self._lock_frame.pack_forget()
         self._main_frame.pack(fill="both", expand=True)
         self._open_folders = set()
+        self._search_var.set("")
         self._last_activity = time.monotonic()
         self._refresh()
         self._schedule_tick()
@@ -480,6 +544,20 @@ class VaultApp:
         """当前上下文文件夹：选中文件夹时为其本身，否则为根目录。"""
         folders = self._selected_folder_paths()
         return folders[0] if folders else ""
+
+    def _on_tree_click(self, event) -> None:
+        """点击树的空白区域时取消选择，回到根目录上下文。"""
+        if self._tree.identify_row(event.y):
+            return
+        if self._tree.identify_region(event.x, event.y) in ("heading", "separator"):
+            return
+        self._clear_selection()
+
+    def _clear_selection(self) -> None:
+        selection = self._tree.selection()
+        if selection:
+            self._tree.selection_remove(*selection)
+        self._tree.focus("")
 
     # ================= 导入（保留目录结构）=================
     def _on_new_folder(self) -> None:
@@ -854,40 +932,117 @@ class VaultApp:
         else:
             self._open_folders.discard(rel)
 
+    # ================= 排序 / 搜索 =================
+    def _on_sort(self, column: str) -> None:
+        """点击表头：同一列切换升降序，不同列重置为升序。"""
+        if self._sort_column == column:
+            self._sort_desc = not self._sort_desc
+        else:
+            self._sort_column = column
+            self._sort_desc = False
+        self._update_headings()
+        self._refresh()
+
+    def _update_headings(self) -> None:
+        labels = {"name": ("#0", "名称"), "size": ("size", "大小"), "mtime": ("mtime", "修改时间")}
+        for key, (column_id, label) in labels.items():
+            mark = ""
+            if key == self._sort_column:
+                mark = " ▼" if self._sort_desc else " ▲"
+            self._tree.heading(column_id, text=label + mark)
+
+    def _on_search_changed(self, _event=None) -> None:
+        if self._search_job is not None:
+            self.root.after_cancel(self._search_job)
+        self._search_job = self.root.after(180, self._apply_search)
+
+    def _apply_search(self) -> None:
+        self._search_job = None
+        self._refresh()
+
+    def _clear_search(self) -> str:
+        if self._search_job is not None:
+            self.root.after_cancel(self._search_job)
+            self._search_job = None
+        self._search_var.set("")
+        self._search_entry.focus_set()
+        self._refresh()
+        return "break"
+
     def _refresh(self) -> None:
         if not self.vault.is_unlocked:
             return
         selection = set(self._tree.selection())
         self._tree.delete(*self._tree.get_children(""))
 
+        query = self._search_var.get().strip()
         files = self.vault.list_files()
         folders = set(self.vault.list_folders())
         for info in files:
             folders |= set(ancestors_of(info["path"]))
-        self._open_folders &= folders
+
+        if query:
+            # 关键字匹配文件/文件夹的相对路径，并保留匹配项的上级目录
+            needle = query.lower()
+            files = [info for info in files if needle in info["path"].lower()]
+            matched_folders = {rel for rel in folders if needle in rel.lower()}
+            folders = set(matched_folders)
+            for info in files:
+                folders |= set(ancestors_of(info["path"]))
+            for rel in list(folders):
+                folders |= set(ancestors_of(rel))
+            expanded = set(self._open_folders)
+            for info in files:
+                expanded |= set(ancestors_of(info["path"]))
+            for rel in folders:
+                expanded |= set(ancestors_of(rel))
+        else:
+            self._open_folders &= folders
+            expanded = self._open_folders
+
+        # 排序：文件夹始终排在文件前面；大小/时间列对文件夹无意义，保持名称升序
+        folder_key = lambda rel: name_of(rel).lower()          # noqa: E731
+        folder_desc = self._sort_desc if self._sort_column == "name" else False
+        if self._sort_column == "size":
+            file_key = lambda info: info["size"]               # noqa: E731
+        elif self._sort_column == "mtime":
+            file_key = lambda info: info["mtime"]              # noqa: E731
+        else:
+            file_key = lambda info: name_of(info["path"]).lower()  # noqa: E731
 
         nodes = {"": ""}
-        # 先插文件夹（按深度排序，保证父节点先于子节点）
-        for rel in sorted(folders, key=lambda r: (r.count("/"), r.lower())):
-            parent = nodes.get(parent_of(rel), "")
-            iid = FOLDER_PREFIX + rel
-            self._tree.insert(
-                parent, "end", iid=iid, text=name_of(rel), values=("", ""),
-                open=rel in self._open_folders,
-            )
-            nodes[rel] = iid
-        # 再插文件
-        for info in sorted(files, key=lambda i: i["path"].lower()):
+        # 先按层级插入文件夹（父节点先于子节点），同一目录内按当前列排序
+        max_depth = max((rel.count("/") for rel in folders), default=0)
+        for depth in range(max_depth + 1):
+            level = [rel for rel in folders if rel.count("/") == depth]
+            level.sort(key=folder_key, reverse=folder_desc)
+            for rel in level:
+                parent = nodes.get(parent_of(rel), "")
+                iid = FOLDER_PREFIX + rel
+                self._tree.insert(
+                    parent, "end", iid=iid, text=name_of(rel), values=("", ""),
+                    image=self._folder_icon,
+                    open=rel in expanded,
+                )
+                nodes[rel] = iid
+        # 再插文件：全局排序后再按父目录落位，同一目录内即为当前列顺序
+        for info in sorted(files, key=file_key, reverse=self._sort_desc):
             parent = nodes.get(parent_of(info["path"]), "")
             self._tree.insert(
                 parent, "end", iid=FILE_PREFIX + info["fid"], text=name_of(info["path"]),
                 values=(human_size(info["size"]), info["mtime"]),
+                image=self._file_icon,
             )
 
         for iid in selection:
             if self._tree.exists(iid):
                 self._tree.selection_add(iid)
-        self._set_status(f"保险箱内共 {len(files)} 个文件 · {len(folders)} 个文件夹")
+        if query:
+            self._set_status(
+                f"搜索“{query}”：{len(files)} 个文件 · {len(matched_folders)} 个文件夹"
+            )
+        else:
+            self._set_status(f"保险箱内共 {len(files)} 个文件 · {len(folders)} 个文件夹")
 
     def _set_status(self, text: str) -> None:
         self._status_var.set(text)
