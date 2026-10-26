@@ -19,7 +19,7 @@ jobs:
       matrix:
         include:
           - os: windows-latest
-            package: VaultApp-windows-x64
+            package: VaultApp-windows-x64.exe
           - os: ubuntu-22.04
             package: VaultApp-linux-x64
 
@@ -49,31 +49,22 @@ jobs:
           python -m PyInstaller --noconfirm --clean --onefile --windowed
           --name VaultApp --collect-all tkinterdnd2 vault_app.py
 
-      - name: Package (Windows)
+      - name: Prepare artifact (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force package | Out-Null
-          Copy-Item dist/VaultApp.exe package/
-          Copy-Item README.md package/
-          Compress-Archive -Path package/* -DestinationPath "${{ matrix.package }}.zip"
+        run: Copy-Item dist/VaultApp.exe "${{ matrix.package }}"
 
-      - name: Package (Linux)
+      - name: Prepare artifact (Linux)
         if: runner.os == 'Linux'
         run: |
-          mkdir -p package
-          cp dist/VaultApp package/
-          cp README.md package/
-          chmod +x package/VaultApp
-          tar -czf "${{ matrix.package }}.tar.gz" -C package .
+          cp dist/VaultApp "${{ matrix.package }}"
+          chmod +x "${{ matrix.package }}"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.package }}
-          path: |
-            ${{ matrix.package }}.zip
-            ${{ matrix.package }}.tar.gz
+          path: ${{ matrix.package }}
           if-no-files-found: error
 
   publish:
@@ -91,6 +82,20 @@ jobs:
           path: artifacts
           merge-multiple: true
 
+      - name: Remove stale release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          repo="${{ github.repository }}"
+          tag="${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'latest' }}"
+          ids=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/$repo/releases/tags/$tag" \
+            | jq -r '.assets[]?.id')
+          for id in $ids; do
+            curl -sS -X DELETE -H "Authorization: Bearer $GH_TOKEN" \
+              "https://api.github.com/repos/$repo/releases/assets/$id"
+          done
+
       - name: Create or update Release
         uses: softprops/action-gh-release@v2
         with:
@@ -104,7 +109,9 @@ jobs:
 
             | 平台 | 文件 |
             | --- | --- |
-            | Windows x64 | VaultApp-windows-x64.zip |
-            | Linux x64 | VaultApp-linux-x64.tar.gz |
+            | Windows x64 | VaultApp-windows-x64.exe |
+            | Linux x64 | VaultApp-linux-x64 |
+
+            Linux 版本下载后执行 `chmod +x VaultApp-linux-x64` 即可运行。
           files: artifacts/*
           make_latest: true
