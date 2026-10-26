@@ -44,6 +44,8 @@ except Exception:  # pragma: no cover
 FOLDER_PREFIX = "folder:"
 FILE_PREFIX = "file:"
 ROOT_LABEL = "（根目录）"
+APP_NAME = "便携加密保险箱"
+APP_VERSION = "v1.0.0"
 
 
 def app_dir() -> Path:
@@ -246,7 +248,7 @@ class VaultApp:
     def __init__(self):
         enable_high_dpi()
         self.root = TkinterDnD.Tk() if DND_AVAILABLE else tk.Tk()
-        self.root.title("便携加密保险箱")
+        self.root.title(f"{APP_NAME} {APP_VERSION}")
         self._scale = 1.0
         self._apply_dpi()
         self.root.geometry(f"{self._px(860)}x{self._px(580)}")
@@ -305,9 +307,9 @@ class VaultApp:
         card = ttk.Frame(frame)
         card.place(relx=0.5, rely=0.45, anchor="center")
 
-        ttk.Label(card, text="便携加密保险箱", font=("Segoe UI", 22, "bold")).pack()
+        ttk.Label(card, text=APP_NAME, font=("Segoe UI", 22, "bold")).pack()
         ttk.Label(
-            card, text="在你的移动存储上创建一个受密码保护的私人文件夹",
+            card, text=f"{APP_VERSION} · 在你的移动存储上创建一个受密码保护的私人文件夹",
             foreground="#666",
         ).pack(pady=(6, 22))
 
